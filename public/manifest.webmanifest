@@ -1,0 +1,14 @@
+{
+  "name": "人物画像フィルター",
+  "short_name": "画像フィルター",
+  "description": "人物写真へ簡易な画風フィルターを端末内だけで適用するローカル完結型Webアプリ",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#15161c",
+  "theme_color": "#15161c",
+  "lang": "ja",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
