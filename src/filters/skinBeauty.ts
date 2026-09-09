@@ -1,84 +1,25 @@
 import { buildFragmentShader, inputUniform, paramUniform } from "../rendering/shaders/glslCommon";
 import type { FilterDefinition } from "../types";
+import { chromaBlurPass, lumaBlurPass } from "./shared/skinRetouch";
+
+/**
+ * Band radii, as fractions of face width. See shared/skinRetouch.ts for what the
+ * pair means. This filter can afford a wide low band because it only attenuates
+ * the middle one modestly — it is not trying to erase anything structural.
+ */
+const BAND_LOW_RADIUS = 0.06;
+const BAND_MID_RADIUS = 0.01;
 
 /**
  * Natural skin retouch.
  *
- * The failure mode of every naive "beauty" filter is plastic skin, and it has one
- * cause: they split the image into low and high frequency and then attenuate the
- * HIGH band — which is exactly where pores and fine hair live.
- *
- * This splits luminance into THREE bands instead:
- *
- *   Llow    = wide blur      -> shading and 3-D form. Carries the likeness. Kept.
- *   blemish = Lmid - Llow    -> blotches, oil sheen, uneven tone. Attenuated.
- *   pore    = L    - Lmid    -> pores, fine hair, real skin texture. KEPT (and the
- *                               slider can push it above 1.0 to add texture back).
- *
- * Attenuating only the middle band removes what people actually mean by "blotchy"
- * while leaving both the modelling that makes a face look three-dimensional and the
- * microtexture that makes it read as skin rather than vinyl.
- *
- * The second half of the effect is chroma: blotchy redness is overwhelmingly a
- * CHROMA variance, not a luminance one, so the a/b axes are smoothed far harder
- * than lightness. The eye cannot resolve chroma detail at that scale, so this
- * removes redness and unevenness at essentially no cost in apparent sharpness.
+ * The three-band frequency split this is built on lives in shared/skinRetouch.ts,
+ * which explains why the MIDDLE band is the one that gets attenuated. What is
+ * specific to this filter is the recombination below: the blotch band is weakened
+ * but the pore band is KEPT, and the texture slider can push it above 1.0 to add
+ * microtexture back. That is the whole difference between this and the makeup
+ * filter, which crushes both bands on purpose.
  */
-
-/** Separable blur of OKLab a/b, at half resolution — chroma is perceptually low-frequency. */
-function chromaBlurPass(axis: "x" | "y", readFromOriginal: boolean): string {
-  const src = readFromOriginal ? "uOriginal" : "uSource";
-  const offset =
-    axis === "x" ? "vec2(float(i) * stepPx / uResolution.x, 0.0)" : "vec2(0.0, float(i) * stepPx / uResolution.y)";
-  const decode = readFromOriginal
-    ? `linearRgbToOklab(srgbToLinear(texture(${src}, uv).rgb)).yz`
-    : `texture(${src}, uv).xy * 0.6 - 0.3`;
-  return buildFragmentShader({
-    body: `
-  // Sigma is a fraction of FACE WIDTH so a headshot and a full-body shot get the
-  // same evening-out on the skin itself. The 13 taps are spaced at sigma/2, giving
-  // a total reach of 3 sigma — deliberately, because treating this value as the
-  // per-tap step instead made the kernel reach 6x further than intended and drag
-  // hair and wall color onto the forehead.
-  float faceWidthPx = max(uFaceScale * uResolution.x * 2.5, 24.0);
-  float sigmaPx = max(faceWidthPx * 0.05, 1.0);
-  float stepPx = sigmaPx * 0.5;
-  vec2 sum = vec2(0.0);
-  float wsum = 0.0;
-  for (int i = -6; i <= 6; i++) {
-    float w = gaussW(float(i), 2.0);
-    vec2 uv = vUv + ${offset};
-    sum += (${decode}) * w;
-    wsum += w;
-  }
-  vec2 ab = sum / wsum;
-  // Packed into 0..1; a/b stay well inside +-0.3 for real images.
-  fragColor = vec4((ab + 0.3) / 0.6, 0.0, 1.0);`,
-  });
-}
-
-/** Separable blur of OKLab lightness at a given face-relative radius. */
-function lumaBlurPass(axis: "x" | "y", readFromOriginal: boolean, radiusFactor: number): string {
-  const src = readFromOriginal ? "uOriginal" : "uSource";
-  const offset =
-    axis === "x" ? "vec2(float(i) * stepPx / uResolution.x, 0.0)" : "vec2(0.0, float(i) * stepPx / uResolution.y)";
-  const decode = readFromOriginal ? `linearRgbToOklab(srgbToLinear(texture(${src}, uv).rgb)).x` : `texture(${src}, uv).r`;
-  return buildFragmentShader({
-    body: `
-  float faceWidthPx = max(uFaceScale * uResolution.x * 2.5, 24.0);
-  float sigmaPx = max(faceWidthPx * ${radiusFactor.toFixed(4)}, 0.6);
-  float stepPx = sigmaPx * 0.5;
-  float sum = 0.0;
-  float wsum = 0.0;
-  for (int i = -6; i <= 6; i++) {
-    float w = gaussW(float(i), 2.0);
-    vec2 uv = vUv + ${offset};
-    sum += (${decode}) * w;
-    wsum += w;
-  }
-  fragColor = vec4(sum / wsum, 0.0, 0.0, 1.0);`,
-  });
-}
 
 /**
  * Final recombination. Everything is gated by THREE multiplied terms, and all
@@ -147,12 +88,12 @@ export const skinBeautyFilter: FilterDefinition = {
     { id: "brightness", label: "明るさ", min: 0, max: 100, step: 1, defaultValue: 55 },
   ],
   passes: [
-    { id: "chromaH", fragmentSource: chromaBlurPass("x", true), outputScale: 0.5 },
-    { id: "chromaV", fragmentSource: chromaBlurPass("y", false), outputScale: 0.5 },
-    { id: "lumaLowH", fragmentSource: lumaBlurPass("x", true, 0.060), outputScale: 0.5 },
-    { id: "lumaLowV", fragmentSource: lumaBlurPass("y", false, 0.060), outputScale: 0.5 },
-    { id: "lumaMidH", fragmentSource: lumaBlurPass("x", true, 0.010) },
-    { id: "lumaMidV", fragmentSource: lumaBlurPass("y", false, 0.010) },
+    { id: "chromaH", fragmentSource: chromaBlurPass("x", "original"), outputScale: 0.5 },
+    { id: "chromaV", fragmentSource: chromaBlurPass("y", "chain"), outputScale: 0.5 },
+    { id: "lumaLowH", fragmentSource: lumaBlurPass("x", "original", BAND_LOW_RADIUS), outputScale: 0.5 },
+    { id: "lumaLowV", fragmentSource: lumaBlurPass("y", "chain", BAND_LOW_RADIUS), outputScale: 0.5 },
+    { id: "lumaMidH", fragmentSource: lumaBlurPass("x", "original", BAND_MID_RADIUS) },
+    { id: "lumaMidV", fragmentSource: lumaBlurPass("y", "chain", BAND_MID_RADIUS) },
     {
       id: "composite",
       fragmentSource: compositePass,

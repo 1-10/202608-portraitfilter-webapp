@@ -226,6 +226,73 @@ float faceSkinWeight(vec3 linearRgb, vec2 uv) {
 }
 
 /**
+ * Skin weight for AGGRESSIVE retouching: the detected region, additionally gated
+ * by chroma.
+ *
+ * faceSkinWeight() trusts the region outright when there is a detection, and the
+ * region is a face oval — which includes the fringe of hair hanging over the
+ * forehead. That is fine for a gentle retouch and wrong for a strong one: crushing
+ * texture and averaging chroma across a fringe turns black hair beige.
+ *
+ * The extra gate is chroma ALONE, deliberately, and not skinLikelihood(): that
+ * function's job is to find skin against an unknown background, so it also rejects
+ * anything MORE chromatic than typical skin — which is exactly what a red blotch
+ * is, and blotches are what this filter exists to remove. Hair is the opposite
+ * case, sitting far below skin in chroma whatever its hue, so the low-chroma ramp
+ * alone separates it, and it does so across skin tones.
+ */
+float faceSkinWeightStrict(vec3 linearRgb, vec2 uv) {
+  vec3 lab = linearRgbToOklab(max(linearRgb, 0.0));
+  // Measured on real portraits: skin chroma runs about 0.025-0.10, hair 0.004-0.010.
+  // The ramp has to sit in that gap. Set too high it silently rejects the paler,
+  // lower-chroma parts of the skin as well, which is indistinguishable from the
+  // retouch simply not working.
+  float chromatic = smoothstep(0.012, 0.030, length(lab.yz));
+  // Chroma alone cannot reject a BROWN fringe, which can sit inside skin's chroma
+  // range. Lightness relative to this subject's own skin can: shadowed skin still
+  // reaches two thirds of the median, hair does not come close.
+  float bright = smoothstep(0.55, 0.8, lab.x / max(uFaceSkinLightness, 0.05));
+  float detected = texture(uFaceMask, uv).r;
+  return mix(skinLikelihood(linearRgb), detected * chromatic * bright, uHasFaceMask);
+}
+
+/**
+ * Skin ANYWHERE in frame, not only inside the detected oval.
+ *
+ * The region mask is a face oval and nothing else, so a strong treatment gated on it
+ * alone puts a doll's head on the original body: the face is evened out, lifted and
+ * contoured while the neck, chest and arms keep every blotch and shadow they had.
+ * The step at the jaw is the most conspicuous artifact this kind of filter can
+ * produce, and it is invisible in a head-and-shoulders crop — which is exactly why
+ * it survives review against reference images that are all head crops. Phone beauty
+ * filters treat all visible skin, so this returns the oval judgement OR a
+ * colour-only one, whichever is higher.
+ *
+ * The colour-only branch leans on CHROMA, from measurement: skin runs 0.04-0.10 in
+ * OKLab while a neutral wall runs under 0.03, hair under 0.01, and a grey shirt
+ * near zero. That gap is real but not wide, so a warm and strongly coloured
+ * background can score here. The oval stays the strong prior and this only ever
+ * ADDS to it, so the failure mode is a slightly evened-out wall rather than a
+ * missed face.
+ */
+float faceSkinWeightBroad(vec3 linearRgb, vec2 uv) {
+  vec3 lab = linearRgbToOklab(max(linearRgb, 0.0));
+  float C = length(lab.yz);
+  float h = atan(lab.z, lab.y);
+  float hue = 1.0 - smoothstep(0.0, 0.5, abs(h - 0.785));
+  float chromatic = smoothstep(0.032, 0.05, C) * (1.0 - smoothstep(0.16, 0.26, C));
+  // Relative to the subject's own measured skin, so shadowed skin still counts and
+  // no absolute lightness floor decides which skin tones the filter works on.
+  float bright = smoothstep(0.45, 0.72, lab.x / max(uFaceSkinLightness, 0.05));
+  return max(faceSkinWeightStrict(linearRgb, uv), clamp(hue * chromatic * bright, 0.0, 1.0));
+}
+
+/** The whole face oval, generously feathered. 0 with no detection. */
+float faceRegionWeight(vec2 uv) {
+  return texture(uFaceMask, uv).a * uHasFaceMask;
+}
+
+/**
  * Eyes + lips + brows: the features that must stay sharp when everything else is
  * being flattened or smoothed. Returns 0 with no detection, so callers degrade to
  * "protect nothing specifically" rather than protecting the wrong region.
@@ -233,6 +300,58 @@ float faceSkinWeight(vec3 linearRgb, vec2 uv) {
 float faceFeatureWeight(vec2 uv) {
   vec4 m = texture(uFaceMask, uv);
   return clamp(max(m.g, m.b), 0.0, 1.0) * uHasFaceMask;
+}
+
+/** Image UV -> face-rect local UV. Outside the rect the result leaves 0..1. */
+vec2 faceGeomUv(vec2 uv) {
+  return (uv - uFaceGeomRect.xy) / max(uFaceGeomRect.zw, vec2(1.0e-6));
+}
+
+bool insideGeom(vec2 g) {
+  return all(greaterThanEqual(g, vec2(0.0))) && all(lessThanEqual(g, vec2(1.0)));
+}
+
+/**
+ * Samples a face-rect texture, returning 0 outside the rect.
+ *
+ * The explicit test is not redundant with CLAMP_TO_EDGE: clamping would repeat the
+ * rect's border texels across the whole frame, painting a streak of lipstick out to
+ * the image edge.
+ */
+vec4 sampleGeom(sampler2D tex, vec2 g) {
+  if (!insideGeom(g)) return vec4(0.0);
+  return texture(tex, g);
+}
+
+/**
+ * The mesh deformation, as a UV offset to add before sampling.
+ *
+ * Two independent fields are stored (face shape in .rg, eyes in .ba) and weighted
+ * here, so the deformation sliders are uniforms and nothing is re-rasterized on the
+ * CPU while the user drags. See vision/faceWarpField.ts for the encoding and for
+ * why summing the two groups is sound.
+ *
+ * Byte 128 is exactly zero displacement, so the bias below must stay 128/255.
+ */
+vec2 faceWarpOffset(vec2 uv, float shapeAmount, float eyeAmount) {
+  if (uHasFaceGeometry < 0.5) return vec2(0.0);
+  vec2 g = faceGeomUv(uv);
+  if (!insideGeom(g)) return vec2(0.0);
+  vec4 f = texture(uFaceWarp, g);
+  vec2 shape = (f.rg - vec2(128.0 / 255.0)) * uFaceWarpRange;
+  vec2 eyes = (f.ba - vec2(128.0 / 255.0)) * uFaceWarpRange;
+  return shape * shapeAmount + eyes * eyeAmount;
+}
+
+/**
+ * Where the pixel now at \`uv\` came from before the deformation.
+ *
+ * Passes AFTER the warp must look up the face mask and the makeup masks through
+ * this, because both were baked against the undeformed landmarks. Sampling them at
+ * the raw uv instead slides the lipstick off the lip by exactly the displacement.
+ */
+vec2 faceWarpedUv(vec2 uv, float shapeAmount, float eyeAmount) {
+  return uv + faceWarpOffset(uv, shapeAmount, eyeAmount);
 }
 `;
 
@@ -264,6 +383,36 @@ uniform float uHasFaceMask;
  * instead of the effect shrinking as the subject gets smaller in frame.
  */
 uniform float uFaceScale;
+/**
+ * Mesh geometry baked on the CPU from the face landmarks, all three addressed over
+ * the face rect (uFaceGeomRect) rather than the whole frame — that is what gives a
+ * 1024px makeup texture several hundred pixels across an eye.
+ *
+ *   uFaceWarp   .rg = face-shape displacement   .ba = eye displacement
+ *               signed, biased by 128/255; decode through faceWarpOffset()
+ *   uMakeupA    .r lip fill   .g lip gloss   .b blush     .a eyeshadow
+ *   uMakeupB    .r lash/liner .g brow        .b highlight .a catchlight
+ *
+ * Always bound (1x1 stand-ins when there is no face), so sampling is never
+ * undefined. Gate on uHasFaceGeometry rather than assuming the contents.
+ */
+uniform sampler2D uFaceWarp;
+uniform sampler2D uMakeupA;
+uniform sampler2D uMakeupB;
+/** Face rect in UV space: xy = min corner, zw = size. (0,0,1,1) when absent. */
+uniform vec4 uFaceGeomRect;
+/** UV displacement per unit of encoded warp value, per axis. */
+uniform vec2 uFaceWarpRange;
+/** 1.0 when the three textures above hold a real bake, 0.0 when they are stand-ins. */
+uniform float uHasFaceGeometry;
+/**
+ * This subject's own median skin lightness (OKLab L), measured per image.
+ *
+ * The reference a relative test needs: hair is a fraction of skin's lightness, but
+ * an ABSOLUTE floor is the mistake that makes a filter work on pale skin and fail
+ * on dark skin. Falls back to a mid-tone when no face was measured.
+ */
+uniform float uFaceSkinLightness;
 `;
 
 export type BuildFragmentShaderOptions = {

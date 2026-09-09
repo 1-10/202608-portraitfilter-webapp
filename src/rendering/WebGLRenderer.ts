@@ -1,4 +1,7 @@
 import type { FilterDefinition, FilterParamValues } from "../types";
+import type { AuxTextureData } from "../vision/auxTexture";
+import type { FaceGeometry } from "../vision/faceGeometry";
+import { DEFAULT_SKIN_LIGHTNESS } from "../vision/skinLightness";
 import { ShaderProgram } from "./ShaderProgram";
 import { TextureManager, type PooledTarget } from "./TextureManager";
 import { buildFragmentShader, FULLSCREEN_VERT, inputUniform, paramUniform } from "./shaders/glslCommon";
@@ -13,8 +16,11 @@ export type RenderTargetPixels = {
 
 const BLIT_FRAGMENT = buildFragmentShader({ body: "  fragColor = texture(uSource, vUv);" });
 
-/** TextureManager key for the MediaPipe-derived face mask. */
+/** TextureManager keys for the CPU-baked, MediaPipe-derived textures. */
 const FACE_MASK_TEXTURE = "faceMask";
+const FACE_WARP_TEXTURE = "faceWarp";
+const MAKEUP_A_TEXTURE = "makeupA";
+const MAKEUP_B_TEXTURE = "makeupB";
 
 /** Assumed interocular fraction when no face was detected. Mirrors useFilterRenderer. */
 const DEFAULT_FACE_SCALE = 0.14;
@@ -36,7 +42,8 @@ export class WebGLRenderer {
   private lastImageSource: TexImageSource | null = null;
   private lastImageWidth = 0;
   private lastImageHeight = 0;
-  private lastFaceMaskSource: TexImageSource | null = null;
+  private lastFaceMask: AuxTextureData | null = null;
+  private lastFaceGeometry: FaceGeometry | null = null;
   private faceScale = DEFAULT_FACE_SCALE;
 
   private contextLost = false;
@@ -88,8 +95,11 @@ export class WebGLRenderer {
     if (this.lastImageSource) {
       this.textures.setOriginalImage(this.lastImageSource, this.lastImageWidth, this.lastImageHeight);
     }
-    if (this.lastFaceMaskSource) {
-      this.textures.setAuxTexture(FACE_MASK_TEXTURE, this.lastFaceMaskSource);
+    if (this.lastFaceMask) {
+      this.uploadAux(FACE_MASK_TEXTURE, this.lastFaceMask);
+    }
+    if (this.lastFaceGeometry) {
+      this.uploadFaceGeometry(this.lastFaceGeometry);
     }
     this.onRestored?.();
   };
@@ -101,26 +111,60 @@ export class WebGLRenderer {
     this.lastImageHeight = height;
   }
 
+  private uploadAux(name: string, texture: AuxTextureData): void {
+    this.textures.setAuxTextureData(name, texture.data, texture.width, texture.height);
+  }
+
   /**
    * Supplies (or clears with `null`) the face-region mask that every pass of every
    * filter can sample as `uFaceMask`. The mask is a small fixed-resolution texture
    * addressed by normalized UV, so it deliberately does NOT need regenerating when
    * the render resolution changes between preview, thumbnail and export.
    */
-  setFaceMask(source: TexImageSource | null, faceScale = DEFAULT_FACE_SCALE): void {
-    if (source) {
-      this.textures.setAuxTexture(FACE_MASK_TEXTURE, source);
-      this.lastFaceMaskSource = source;
+  setFaceMask(mask: AuxTextureData | null, faceScale = DEFAULT_FACE_SCALE): void {
+    if (mask) {
+      this.uploadAux(FACE_MASK_TEXTURE, mask);
+      this.lastFaceMask = mask;
       this.faceScale = faceScale;
     } else {
       this.textures.clearAuxTexture(FACE_MASK_TEXTURE);
-      this.lastFaceMaskSource = null;
+      this.lastFaceMask = null;
       this.faceScale = DEFAULT_FACE_SCALE;
     }
   }
 
   hasFaceMask(): boolean {
-    return this.lastFaceMaskSource !== null;
+    return this.lastFaceMask !== null;
+  }
+
+  private uploadFaceGeometry(geometry: FaceGeometry): void {
+    this.uploadAux(FACE_WARP_TEXTURE, geometry.warp);
+    this.uploadAux(MAKEUP_A_TEXTURE, geometry.makeupA);
+    this.uploadAux(MAKEUP_B_TEXTURE, geometry.makeupB);
+  }
+
+  /**
+   * Supplies (or clears with `null`) the baked mesh deformation and makeup masks.
+   *
+   * Like the mask these are normalized-UV textures, so one bake per image serves
+   * the preview, every thumbnail and the full-resolution export. Sliders only
+   * reweight them, which is why dragging one costs a uniform update rather than a
+   * CPU re-rasterization.
+   */
+  setFaceGeometry(geometry: FaceGeometry | null): void {
+    if (geometry) {
+      this.uploadFaceGeometry(geometry);
+      this.lastFaceGeometry = geometry;
+    } else {
+      this.textures.clearAuxTexture(FACE_WARP_TEXTURE);
+      this.textures.clearAuxTexture(MAKEUP_A_TEXTURE);
+      this.textures.clearAuxTexture(MAKEUP_B_TEXTURE);
+      this.lastFaceGeometry = null;
+    }
+  }
+
+  hasFaceGeometry(): boolean {
+    return this.lastFaceGeometry !== null;
   }
 
   private getProgram(key: string, fragmentSource: string): ShaderProgram {
@@ -205,6 +249,32 @@ export class WebGLRenderer {
       program.setFloat("uHasFaceMask", faceMaskTexture ? 1 : 0);
       program.setFloat("uFaceScale", this.faceScale);
       unit += 1;
+
+      // The baked mesh geometry occupies three more fixed units, on the same terms:
+      // bound for every pass so no sampler is ever left undefined, and gated by
+      // uHasFaceGeometry rather than by which filter is running.
+      const geometry = this.lastFaceGeometry;
+      const warpTexture = this.textures.getAuxTexture(FACE_WARP_TEXTURE);
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, warpTexture ?? this.textures.getNeutralWarpTexture());
+      program.setInt("uFaceWarp", unit);
+      unit += 1;
+      for (const [name, key] of [
+        ["uMakeupA", MAKEUP_A_TEXTURE],
+        ["uMakeupB", MAKEUP_B_TEXTURE],
+      ] as const) {
+        const tex = this.textures.getAuxTexture(key);
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, tex ?? this.textures.getPlaceholderMaskTexture());
+        program.setInt(name, unit);
+        unit += 1;
+      }
+      program.setFloat("uHasFaceGeometry", geometry ? 1 : 0);
+      const rect = geometry?.rectUv ?? [0, 0, 1, 1];
+      program.setVec4("uFaceGeomRect", rect[0], rect[1], rect[2], rect[3]);
+      const warpRange = geometry?.warpRange ?? [0, 0];
+      program.setVec2("uFaceWarpRange", warpRange[0], warpRange[1]);
+      program.setFloat("uFaceSkinLightness", geometry?.skinLightness ?? DEFAULT_SKIN_LIGHTNESS);
 
       for (const inputId of pass.extraInputs ?? []) {
         const source = inputId === "original" ? { texture: originalTexture } : outputsById.get(inputId);

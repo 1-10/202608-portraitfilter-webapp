@@ -3,7 +3,16 @@ import path from "node:path";
 import { FIXTURES } from "./fixturesPath";
 import { setRangeValue } from "./utils";
 
-const FILTER_NAMES = ["オリジナル", "ナチュラル美肌", "シネマティック", "ロトスコープ", "水彩", "コミック", "デュオトーン"];
+const FILTER_NAMES = [
+  "オリジナル",
+  "ナチュラル美肌",
+  "ビューティーメイク",
+  "シネマティック",
+  "ロトスコープ",
+  "水彩",
+  "コミック",
+  "デュオトーン",
+];
 
 async function loadImage(page: import("@playwright/test").Page) {
   await page.goto("/");
@@ -11,7 +20,7 @@ async function loadImage(page: import("@playwright/test").Page) {
   await expect(page.getByRole("button", { name: "画像を変更" })).toBeVisible();
 }
 
-test("all 7 filters can be selected without error", async ({ page }) => {
+test("all 8 filters can be selected without error", async ({ page }) => {
   const errors: string[] = [];
   page.on("pageerror", (err) => errors.push(err.message));
 
