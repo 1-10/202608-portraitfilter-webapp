@@ -66,7 +66,10 @@ test("all filters still work when the face model cannot be loaded", async ({ pag
   await expect(page.getByRole("button", { name: "画像を変更" })).toBeVisible();
   await page.waitForTimeout(3000);
 
-  for (const name of ["ナチュラル美肌", "シネマティック", "ロトスコープ", "水彩"]) {
+  // The makeup filter is the strictest case: with no model there is no mesh and no
+  // makeup masks, so it has to degrade to a plain skin-and-tone filter rather than
+  // scramble the frame with an undecodable displacement field.
+  for (const name of ["ナチュラル美肌", "ビューティーメイク", "シネマティック", "ロトスコープ", "水彩"]) {
     await page.getByRole("radio", { name }).click();
     await expect(page.getByRole("radio", { name, checked: true })).toBeVisible();
   }

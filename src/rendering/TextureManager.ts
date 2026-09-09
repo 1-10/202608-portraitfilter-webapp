@@ -19,7 +19,8 @@ export class TextureManager {
   private originalWidth = 0;
   private originalHeight = 0;
   private readonly auxTextures = new Map<string, WebGLTexture>();
-  private placeholderMaskTexture: WebGLTexture | null = null;
+  /** 1x1 textures bound wherever a sampler must be populated but no real data exists. */
+  private readonly constantTextures = new Map<string, WebGLTexture>();
 
   constructor(gl: WebGL2RenderingContext) {
     this.gl = gl;
@@ -61,11 +62,16 @@ export class TextureManager {
   }
 
   /**
-   * Uploads a CPU-produced auxiliary texture (currently the face mask) under a
-   * name. Uses the same UNPACK_FLIP_Y_WEBGL as setOriginalImage — without it the
-   * mask would be vertically mirrored relative to the image it describes.
+   * Uploads a CPU-produced auxiliary texture (face mask, warp field, makeup masks)
+   * under a name, from raw bytes.
+   *
+   * Raw bytes rather than a canvas, because these textures carry DATA in all four
+   * channels: a 2D canvas stores premultiplied colour, so routing a four-mask pack
+   * through one would quantize .r/.g/.b wherever .a is below 255. Array uploads
+   * also ignore UNPACK_FLIP_Y_WEBGL, so producers pack bottom-up — the contract is
+   * stated in vision/auxTexture.ts.
    */
-  setAuxTexture(name: string, source: TexImageSource): WebGLTexture {
+  setAuxTextureData(name: string, data: Uint8Array, width: number, height: number): WebGLTexture {
     const gl = this.gl;
     let tex = this.auxTextures.get(name) ?? null;
     if (!tex) {
@@ -74,9 +80,7 @@ export class TextureManager {
       this.auxTextures.set(name, tex);
     }
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -106,17 +110,35 @@ export class TextureManager {
    * skin", which would smooth or flatten the entire frame.
    */
   getPlaceholderMaskTexture(): WebGLTexture {
+    return this.getConstantTexture("mask:0,0,0,255", 0, 0, 0, 255);
+  }
+
+  /**
+   * The stand-in for the displacement field, encoding zero displacement (byte 128
+   * per axis — see faceWarpField.ts) rather than black.
+   *
+   * Shaders gate on uHasFaceGeometry, so this should never be decoded. It matters
+   * anyway: black would decode to a FULL-magnitude displacement, which is a
+   * scrambled frame rather than a missing effect, and the two failure modes are
+   * not equally recoverable.
+   */
+  getNeutralWarpTexture(): WebGLTexture {
+    return this.getConstantTexture("warp:128,128,128,128", 128, 128, 128, 128);
+  }
+
+  private getConstantTexture(key: string, r: number, g: number, b: number, a: number): WebGLTexture {
     const gl = this.gl;
-    if (this.placeholderMaskTexture) return this.placeholderMaskTexture;
+    const existing = this.constantTextures.get(key);
+    if (existing) return existing;
     const tex = gl.createTexture();
     if (!tex) throw new Error("テクスチャを作成できませんでした。");
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([r, g, b, a]));
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    this.placeholderMaskTexture = tex;
+    this.constantTextures.set(key, tex);
     return tex;
   }
 
@@ -189,9 +211,9 @@ export class TextureManager {
       this.gl.deleteTexture(tex);
     }
     this.auxTextures.clear();
-    if (this.placeholderMaskTexture) {
-      this.gl.deleteTexture(this.placeholderMaskTexture);
-      this.placeholderMaskTexture = null;
+    for (const tex of this.constantTextures.values()) {
+      this.gl.deleteTexture(tex);
     }
+    this.constantTextures.clear();
   }
 }

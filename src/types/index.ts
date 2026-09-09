@@ -11,6 +11,15 @@ export type FilterParameter = {
 
 export type ShaderPassDefinition = {
   id: string;
+  /**
+   * Human-readable name for the dev-only debug pass picker. Optional; the picker
+   * falls back to the id.
+   *
+   * Declared HERE rather than in a lookup table beside the picker: a table keyed by
+   * pass id is a copy of information that lives in this file, and it goes stale
+   * silently the moment a pass is renamed or added.
+   */
+  label?: string;
   /** Fragment shader GLSL source (ES3, #version 300 es). */
   fragmentSource: string;
   /** Scale factor applied to the working resolution for this pass's output framebuffer (1 = full working res). */

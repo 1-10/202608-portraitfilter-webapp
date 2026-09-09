@@ -68,6 +68,11 @@ export class ShaderProgram {
     if (loc) this.gl.uniform2f(loc, x, y);
   }
 
+  setVec4(name: string, x: number, y: number, z: number, w: number): void {
+    const loc = this.location(name);
+    if (loc) this.gl.uniform4f(loc, x, y, z, w);
+  }
+
   setInt(name: string, value: number): void {
     const loc = this.location(name);
     if (loc) this.gl.uniform1i(loc, value);

@@ -1,4 +1,5 @@
 import type { FilterDefinition, FilterParamValues } from "../types";
+import { beautyMakeupFilter } from "./beautyMakeup";
 import { cinematicFilter } from "./cinematic";
 import { comicFilter } from "./comic";
 import { duotoneFilter } from "./duotone";
@@ -10,6 +11,7 @@ import { watercolorFilter } from "./watercolor";
 export const FILTERS: FilterDefinition[] = [
   originalFilter,
   skinBeautyFilter,
+  beautyMakeupFilter,
   cinematicFilter,
   rotoscopeFilter,
   watercolorFilter,

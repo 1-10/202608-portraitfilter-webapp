@@ -5,7 +5,9 @@ import { WebGLRenderer, WebGLUnsupportedError } from "../rendering/WebGLRenderer
 import type { AppError, FilterDefinition, FilterParamValues, LoadedImage, OutputFormat } from "../types";
 import { pickPreviewMaxEdge } from "../utils/dimensions";
 import { createWorkingCanvas } from "../utils/workingCanvas";
-import { detectFaceMask, disposeFaceLandmarker } from "../vision/faceLandmarks";
+import { buildFaceGeometry } from "../vision/faceGeometry";
+import { detectFace, disposeFaceLandmarker } from "../vision/faceLandmarks";
+import { buildFaceMaskTexture } from "../vision/faceMask";
 
 type WorkingImage = { canvas: HTMLCanvasElement; width: number; height: number };
 
@@ -73,11 +75,12 @@ export function useFilterRenderer(canvasRef: RefObject<HTMLCanvasElement>) {
       fullBitmapRef.current = loaded.bitmap;
       const working = createWorkingCanvas(loaded.bitmap, loaded.width, loaded.height, pickPreviewMaxEdge());
       workingRef.current = working;
-      // Drop the previous subject's face mask synchronously, BEFORE anything can
-      // render the new image. Detection is async, so without this the old mask
-      // would be applied to the new photo for as long as detection takes —
-      // smoothing or flattening a region belonging to a different face.
+      // Drop the previous subject's mask and baked geometry synchronously, BEFORE
+      // anything can render the new image. Detection is async, so without this the
+      // old data would be applied to the new photo for as long as detection takes —
+      // slimming a jaw and painting lipstick using another person's landmarks.
       renderer.setFaceMask(null);
+      renderer.setFaceGeometry(null);
       setFaceScale(DEFAULT_FACE_SCALE);
       setFaceMaskActive(false);
       renderer.setImage(working.canvas, working.width, working.height);
@@ -86,20 +89,37 @@ export function useFilterRenderer(canvasRef: RefObject<HTMLCanvasElement>) {
   );
 
   /**
-   * Runs face detection on the current working image and applies the resulting
-   * mask. Resolves to true only when a real mask was applied, so callers know
-   * whether anything needs re-rendering. Never rejects — detection is optional.
+   * Runs face detection on the current working image and bakes everything derived
+   * from it: the region mask every filter samples, and the mesh deformation and
+   * makeup masks the makeup filter samples.
+   *
+   * Resolves to true only when something was actually applied, so callers know
+   * whether a re-render is needed. Never rejects — detection is optional, and a
+   * photo with no face in it is a valid input.
    */
   const runFaceDetection = useCallback(async (): Promise<boolean> => {
     const renderer = rendererRef.current;
     const working = workingRef.current;
     if (!renderer || !working) return false;
-    const result = await detectFaceMask(working.canvas);
+    const detection = await detectFace(working.canvas);
     // The renderer may have moved on to a different image while we were away.
-    if (!result || workingRef.current !== working) return false;
-    renderer.setFaceMask(result.canvas, result.faceScale);
-    setFaceScale(result.faceScale);
+    if (!detection || workingRef.current !== working) return false;
+
+    const mask = buildFaceMaskTexture(
+      detection.landmarks,
+      detection.maskRings,
+      detection.imageWidth,
+      detection.imageHeight,
+    );
+    if (!mask) return false;
+    renderer.setFaceMask(mask.texture, mask.faceScale);
+    setFaceScale(mask.faceScale);
     setFaceMaskActive(true);
+
+    // The geometry bake is a further best-effort step on top: it can fail on its
+    // own (degenerate rings, a tessellation the model did not publish) without
+    // costing the mask, so filters that only need the mask are unaffected.
+    renderer.setFaceGeometry(buildFaceGeometry(working.canvas, detection.landmarks, detection.topology));
     return true;
   }, []);
 

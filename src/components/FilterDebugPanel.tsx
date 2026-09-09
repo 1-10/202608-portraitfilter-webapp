@@ -19,26 +19,11 @@ type Props = {
   faceScale: number;
 };
 
-const PASS_LABELS: Record<string, string> = {
-  structure: "structure (色面)",
-  region: "region (肌/水分)",
-  pigmentWash: "pigmentWash (顔料)",
-  bleedH1: "bleedH1",
-  bleedV1: "bleedV1",
-  bleedH2: "bleedH2",
-  bleedV2: "bleedV2",
-  edgeDeposit: "edgeDeposit (沈着)",
-  detailRestore: "detailRestore (輪郭)",
-  paperInteract: "paperInteract (紙)",
-  finalComposite: "finalComposite (最終)",
-};
-
 /**
- * Dev-only debug view for the watercolor pipeline (spec §11): lets you pick any
- * intermediate pass to view its raw output on the live canvas, and renders a
- * side-by-side thumbnail comparison of the original image against the 3
- * presets. Tree-shaken out of production builds since callers gate this
- * behind `import.meta.env.DEV`.
+ * Dev-only debug view for any multi-pass filter: lets you pick an intermediate
+ * pass to view its raw output on the live canvas, and renders a side-by-side
+ * thumbnail comparison of the original image against every preset. Tree-shaken out
+ * of production builds since callers gate this behind `import.meta.env.DEV`.
  */
 export default function FilterDebugPanel({
   filter,
@@ -116,7 +101,7 @@ export default function FilterDebugPanel({
               className={debugPassId === pass.id ? `${styles.passButton} ${styles.passButtonActive}` : styles.passButton}
               onClick={() => selectPass(pass.id)}
             >
-              {PASS_LABELS[pass.id] ?? pass.id}
+              {pass.label ?? pass.id}
             </button>
           ))}
         </div>
