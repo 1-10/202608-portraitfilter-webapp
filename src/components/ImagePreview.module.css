@@ -29,11 +29,16 @@
   object-fit: contain;
 }
 
-.canvasWrap .canvas:first-child {
+.primaryCanvas {
   position: relative;
 }
 
-.canvasWrap .canvas:last-child {
+/* Positioned by an explicit class rather than :last-child: the processing
+   badge below is inserted as a sibling after both canvases while a render is
+   in flight, and a positional selector would silently stop matching whenever
+   that badge (or any future sibling) is present, dropping this canvas back
+   into flex flow and shoving the primary canvas sideways for a frame. */
+.overlayCanvas {
   position: absolute;
   inset: 0;
   margin: auto;
