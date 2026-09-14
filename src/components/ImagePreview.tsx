@@ -21,10 +21,14 @@ export default function ImagePreview({
   return (
     <div className={styles.stage}>
       <div className={styles.canvasWrap}>
-        <canvas ref={canvasRef} className={styles.canvas} />
+        <canvas ref={canvasRef} className={`${styles.canvas} ${styles.primaryCanvas}`} />
         <canvas
           ref={overlayCanvasRef}
-          className={compareHeld ? `${styles.canvas} ${styles.overlayVisible}` : `${styles.canvas} ${styles.overlayHidden}`}
+          className={
+            compareHeld
+              ? `${styles.canvas} ${styles.overlayCanvas} ${styles.overlayVisible}`
+              : `${styles.canvas} ${styles.overlayCanvas} ${styles.overlayHidden}`
+          }
         />
         {isProcessing && (
           <div className={styles.processingBadge} role="status" aria-live="polite">
