@@ -7,6 +7,7 @@ const FILTER_NAMES = [
   "オリジナル",
   "ナチュラル美肌",
   "ビューティーメイク",
+  "AIルック",
   "シネマティック",
   "ロトスコープ",
   "水彩",
@@ -20,7 +21,7 @@ async function loadImage(page: import("@playwright/test").Page) {
   await expect(page.getByRole("button", { name: "画像を変更" })).toBeVisible();
 }
 
-test("all 8 filters can be selected without error", async ({ page }) => {
+test("all 9 filters can be selected without error", async ({ page }) => {
   const errors: string[] = [];
   page.on("pageerror", (err) => errors.push(err.message));
 

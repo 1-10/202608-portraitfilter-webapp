@@ -56,6 +56,7 @@ test("image loading, filtering and export never send data off-device", async ({ 
  */
 test("all filters still work when the face model cannot be loaded", async ({ page }) => {
   await page.route("**/*.task", (route) => route.abort());
+  await page.route("**/*.tflite", (route) => route.abort());
   await page.route("**/*.wasm", (route) => route.abort());
 
   const errors: string[] = [];
@@ -69,7 +70,32 @@ test("all filters still work when the face model cannot be loaded", async ({ pag
   // The makeup filter is the strictest case: with no model there is no mesh and no
   // makeup masks, so it has to degrade to a plain skin-and-tone filter rather than
   // scramble the frame with an undecodable displacement field.
-  for (const name of ["ナチュラル美肌", "ビューティーメイク", "シネマティック", "ロトスコープ", "水彩"]) {
+  for (const name of ["ナチュラル美肌", "ビューティーメイク", "AIルック", "シネマティック", "ロトスコープ", "水彩"]) {
+    await page.getByRole("radio", { name }).click();
+    await expect(page.getByRole("radio", { name, checked: true })).toBeVisible();
+  }
+
+  await expect(page.getByText("フィルターの描画に失敗")).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+/**
+ * The person segmenter is a separate model from the landmarker and can fail on its
+ * own. Losing it must cost only the segmentation: the face mask still applies and the
+ * filters that use both fall back to their colour heuristics for skin and hair.
+ */
+test("face-aware filters still work when only the segmentation model cannot be loaded", async ({ page }) => {
+  await page.route("**/*.tflite", (route) => route.abort());
+
+  const errors: string[] = [];
+  page.on("pageerror", (err) => errors.push(err.message));
+
+  await page.goto("/");
+  await page.getByLabel("画像ファイルを選択").setInputFiles(path.join(FIXTURES, "portrait.jpg"));
+  await expect(page.getByRole("button", { name: "画像を変更" })).toBeVisible();
+  await page.waitForTimeout(8000);
+
+  for (const name of ["ナチュラル美肌", "ビューティーメイク", "AIルック"]) {
     await page.getByRole("radio", { name }).click();
     await expect(page.getByRole("radio", { name, checked: true })).toBeVisible();
   }

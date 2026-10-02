@@ -34,8 +34,8 @@ describe("defaultParamValues", () => {
 });
 
 describe("FILTERS", () => {
-  it("includes exactly the 8 filters with unique ids", () => {
-    expect(FILTERS).toHaveLength(8);
+  it("includes exactly the 9 filters with unique ids", () => {
+    expect(FILTERS).toHaveLength(9);
     const ids = FILTERS.map((f) => f.id);
     expect(new Set(ids).size).toBe(ids.length);
   });

@@ -1,5 +1,6 @@
 /**
- * Measures this subject's own skin lightness, so filters can tell hair from skin
+ * Measures this subject's own skin tone (OKLab lightness and a/b), so filters can
+ * tell hair from skin, and a flushed cheek from this person's ordinary complexion,
  * without a threshold baked in at authoring time.
  *
  * Chroma alone separates black hair from skin, but not brown hair: a warm fringe
@@ -18,22 +19,32 @@ import { distance, type FaceFrame, type Pt } from "./faceMeshTopology";
 /** Samples per axis over the face bounding box. */
 const GRID = 20;
 
-/** Used when the measurement cannot be taken. Mid-tone: neither gate nor free pass. */
-export const DEFAULT_SKIN_LIGHTNESS = 0.62;
+/** This subject's median skin colour, in OKLab. */
+export type SkinTone = { l: number; a: number; b: number };
+
+/**
+ * Used when the measurement cannot be taken. Mid-tone lightness — neither gate nor
+ * free pass — and the a/b of typical skin, so a relative redness test stays inert.
+ */
+export const DEFAULT_SKIN_TONE: SkinTone = { l: 0.62, a: 0.05, b: 0.033 };
 
 function srgbChannelToLinear(c: number): number {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
-/** OKLab lightness of an sRGB byte triple. Mirrors linearRgbToOklab in the shaders. */
-function oklabLightness(r: number, g: number, b: number): number {
+/** OKLab of an sRGB byte triple. Mirrors linearRgbToOklab in the shaders. */
+function oklab(r: number, g: number, b: number): SkinTone {
   const lr = srgbChannelToLinear(r / 255);
   const lg = srgbChannelToLinear(g / 255);
   const lb = srgbChannelToLinear(b / 255);
   const l = Math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
   const m = Math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
   const s = Math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
-  return 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s;
+  return {
+    l: 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+    a: 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+    b: 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+  };
 }
 
 function pointInPolygon(p: Pt, polygon: readonly Pt[]): boolean {
@@ -49,17 +60,17 @@ function pointInPolygon(p: Pt, polygon: readonly Pt[]): boolean {
 }
 
 /**
- * Median OKLab lightness of the subject's skin, or `null` if it cannot be read.
+ * Per-channel median OKLab of the subject's skin, or `null` if it cannot be read.
  *
  * `source` must be the same canvas the landmarks were detected on, since the
  * landmark pixel positions are taken at its resolution.
  */
-export function measureSkinLightness(
+export function measureSkinTone(
   source: HTMLCanvasElement,
   points: readonly Pt[],
   ovalRing: readonly number[],
   frame: FaceFrame,
-): number | null {
+): SkinTone | null {
   const oval = ovalRing.map((i) => points[i]).filter((p): p is Pt => !!p);
   if (oval.length < 3) return null;
 
@@ -92,7 +103,7 @@ export function measureSkinLightness(
     { center: frame.lipsCenter, radius: frame.faceWidth * 0.3 },
   ];
 
-  const samples: number[] = [];
+  const samples: SkinTone[] = [];
   for (let gy = 0; gy < GRID; gy++) {
     for (let gx = 0; gx < GRID; gx++) {
       const px = minX + ((gx + 0.5) / GRID) * (maxX - minX);
@@ -103,10 +114,13 @@ export function measureSkinLightness(
       const ix = Math.min(width - 1, Math.max(0, Math.round(px - x0)));
       const iy = Math.min(height - 1, Math.max(0, Math.round(py - y0)));
       const o = (iy * width + ix) * 4;
-      samples.push(oklabLightness(image.data[o]!, image.data[o + 1]!, image.data[o + 2]!));
+      samples.push(oklab(image.data[o]!, image.data[o + 1]!, image.data[o + 2]!));
     }
   }
   if (samples.length < 12) return null;
-  samples.sort((a, b) => a - b);
-  return samples[Math.floor(samples.length / 2)]!;
+  const median = (channel: keyof SkinTone): number => {
+    const values = samples.map((t) => t[channel]).sort((x, y) => x - y);
+    return values[Math.floor(values.length / 2)]!;
+  };
+  return { l: median("l"), a: median("a"), b: median("b") };
 }

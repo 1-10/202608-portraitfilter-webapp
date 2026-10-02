@@ -18,7 +18,7 @@ import {
   type NormalizedLandmark,
 } from "./faceMeshTopology";
 import { buildWarpFieldCanvas } from "./faceWarpField";
-import { DEFAULT_SKIN_LIGHTNESS, measureSkinLightness } from "./skinLightness";
+import { DEFAULT_SKIN_TONE, measureSkinTone, type SkinTone } from "./skinTone";
 
 /**
  * The mesh topology and region rings, derived once from the model's published
@@ -46,8 +46,8 @@ export type FaceGeometry = {
   rectUv: [number, number, number, number];
   /** Image-UV displacement represented by a full unit of encoded channel value. */
   warpRange: [number, number];
-  /** This subject's own median skin lightness, in OKLab L. */
-  skinLightness: number;
+  /** This subject's own median skin colour, in OKLab. */
+  skinTone: SkinTone;
 };
 
 /**
@@ -133,7 +133,7 @@ export function buildFaceGeometry(
       rect.h / imageHeight,
     ],
     warpRange: [warp.rangeU, warp.rangeV],
-    skinLightness: measureSkinLightness(source, points, topology.faceOval, frame) ?? DEFAULT_SKIN_LIGHTNESS,
+    skinTone: measureSkinTone(source, points, topology.faceOval, frame) ?? DEFAULT_SKIN_TONE,
   };
 }
 
