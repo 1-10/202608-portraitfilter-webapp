@@ -1,7 +1,8 @@
 import type { FilterDefinition, FilterParamValues } from "../types";
 import type { AuxTextureData } from "../vision/auxTexture";
 import type { FaceGeometry } from "../vision/faceGeometry";
-import { DEFAULT_SKIN_LIGHTNESS } from "../vision/skinLightness";
+import type { PersonSegmentation } from "../vision/personSegmentation";
+import { DEFAULT_SKIN_TONE } from "../vision/skinTone";
 import { ShaderProgram } from "./ShaderProgram";
 import { TextureManager, type PooledTarget } from "./TextureManager";
 import { buildFragmentShader, FULLSCREEN_VERT, inputUniform, paramUniform } from "./shaders/glslCommon";
@@ -21,6 +22,7 @@ const FACE_MASK_TEXTURE = "faceMask";
 const FACE_WARP_TEXTURE = "faceWarp";
 const MAKEUP_A_TEXTURE = "makeupA";
 const MAKEUP_B_TEXTURE = "makeupB";
+const PERSON_SEG_TEXTURE = "personSeg";
 
 /** Assumed interocular fraction when no face was detected. Mirrors useFilterRenderer. */
 const DEFAULT_FACE_SCALE = 0.14;
@@ -44,6 +46,7 @@ export class WebGLRenderer {
   private lastImageHeight = 0;
   private lastFaceMask: AuxTextureData | null = null;
   private lastFaceGeometry: FaceGeometry | null = null;
+  private lastPersonSeg: PersonSegmentation | null = null;
   private faceScale = DEFAULT_FACE_SCALE;
 
   private contextLost = false;
@@ -100,6 +103,9 @@ export class WebGLRenderer {
     }
     if (this.lastFaceGeometry) {
       this.uploadFaceGeometry(this.lastFaceGeometry);
+    }
+    if (this.lastPersonSeg) {
+      this.uploadAux(PERSON_SEG_TEXTURE, this.lastPersonSeg.texture);
     }
     this.onRestored?.();
   };
@@ -165,6 +171,21 @@ export class WebGLRenderer {
 
   hasFaceGeometry(): boolean {
     return this.lastFaceGeometry !== null;
+  }
+
+  /**
+   * Supplies (or clears with `null`) the person-parts segmentation every pass can
+   * sample as `uPersonSeg`. Addressed over its own rect, like the face geometry, so
+   * one segmentation serves preview, thumbnails and export.
+   */
+  setPersonSegmentation(segmentation: PersonSegmentation | null): void {
+    if (segmentation) {
+      this.uploadAux(PERSON_SEG_TEXTURE, segmentation.texture);
+      this.lastPersonSeg = segmentation;
+    } else {
+      this.textures.clearAuxTexture(PERSON_SEG_TEXTURE);
+      this.lastPersonSeg = null;
+    }
   }
 
   private getProgram(key: string, fragmentSource: string): ShaderProgram {
@@ -274,7 +295,18 @@ export class WebGLRenderer {
       program.setVec4("uFaceGeomRect", rect[0], rect[1], rect[2], rect[3]);
       const warpRange = geometry?.warpRange ?? [0, 0];
       program.setVec2("uFaceWarpRange", warpRange[0], warpRange[1]);
-      program.setFloat("uFaceSkinLightness", geometry?.skinLightness ?? DEFAULT_SKIN_LIGHTNESS);
+      const segTexture = this.textures.getAuxTexture(PERSON_SEG_TEXTURE);
+      gl.activeTexture(gl.TEXTURE0 + unit);
+      gl.bindTexture(gl.TEXTURE_2D, segTexture ?? this.textures.getPlaceholderMaskTexture());
+      program.setInt("uPersonSeg", unit);
+      unit += 1;
+      const segRect = this.lastPersonSeg?.rectUv ?? [0, 0, 1, 1];
+      program.setVec4("uPersonSegRect", segRect[0], segRect[1], segRect[2], segRect[3]);
+      program.setFloat("uHasPersonSeg", segTexture && this.lastPersonSeg ? 1 : 0);
+
+      const skinTone = geometry?.skinTone ?? DEFAULT_SKIN_TONE;
+      program.setFloat("uFaceSkinLightness", skinTone.l);
+      program.setVec2("uFaceSkinAb", skinTone.a, skinTone.b);
 
       for (const inputId of pass.extraInputs ?? []) {
         const source = inputId === "original" ? { texture: originalTexture } : outputsById.get(inputId);

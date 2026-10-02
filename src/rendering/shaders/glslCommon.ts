@@ -302,6 +302,24 @@ float faceFeatureWeight(vec2 uv) {
   return clamp(max(m.g, m.b), 0.0, 1.0) * uHasFaceMask;
 }
 
+/** Segmentation confidences at \`uv\` (see uPersonSeg). Zero outside its rect. */
+vec4 personSeg(vec2 uv) {
+  vec2 g = (uv - uPersonSegRect.xy) / max(uPersonSegRect.zw, vec2(1.0e-6));
+  if (any(lessThan(g, vec2(0.0))) || any(greaterThan(g, vec2(1.0)))) return vec4(0.0);
+  return texture(uPersonSeg, g);
+}
+
+/**
+ * How far to trust personSeg() at \`uv\`, 0..1: zero without a segmentation, and
+ * fading out over the outer 8% of its rect, so a filter that mixes it with a colour
+ * heuristic hands over smoothly instead of drawing the rect's edge into the image.
+ */
+float personSegCoverage(vec2 uv) {
+  vec2 g = (uv - uPersonSegRect.xy) / max(uPersonSegRect.zw, vec2(1.0e-6));
+  vec2 edge = smoothstep(vec2(0.0), vec2(0.08), g) * smoothstep(vec2(0.0), vec2(0.08), 1.0 - g);
+  return edge.x * edge.y * uHasPersonSeg;
+}
+
 /** Image UV -> face-rect local UV. Outside the rect the result leaves 0..1. */
 vec2 faceGeomUv(vec2 uv) {
   return (uv - uFaceGeomRect.xy) / max(uFaceGeomRect.zw, vec2(1.0e-6));
@@ -413,6 +431,21 @@ uniform float uHasFaceGeometry;
  * on dark skin. Falls back to a mid-tone when no face was measured.
  */
 uniform float uFaceSkinLightness;
+/**
+ * The same subject's median skin OKLab a/b. The reference for a RELATIVE redness
+ * test: median skin a/b differs a lot between people, so an absolute threshold
+ * flags one person's ordinary complexion as flushed and misses another's flush.
+ */
+uniform vec2 uFaceSkinAb;
+/**
+ * Person parts from the SelfieMulticlass segmenter, addressed over uPersonSegRect:
+ *   .r hair   .g face skin   .b body skin   .a clothes   (model confidences)
+ * Always bound (a 1x1 stand-in when absent). Read through personSeg(), which returns
+ * zero outside the rect, and weigh it with personSegCoverage().
+ */
+uniform sampler2D uPersonSeg;
+uniform vec4 uPersonSegRect;
+uniform float uHasPersonSeg;
 `;
 
 export type BuildFragmentShaderOptions = {

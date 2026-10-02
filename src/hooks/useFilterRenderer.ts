@@ -8,6 +8,8 @@ import { createWorkingCanvas } from "../utils/workingCanvas";
 import { buildFaceGeometry } from "../vision/faceGeometry";
 import { detectFace, disposeFaceLandmarker } from "../vision/faceLandmarks";
 import { buildFaceMaskTexture } from "../vision/faceMask";
+import { faceSquare } from "../vision/faceSearch";
+import { disposePersonSegmenter, segmentPerson } from "../vision/personSegmentation";
 
 type WorkingImage = { canvas: HTMLCanvasElement; width: number; height: number };
 
@@ -61,6 +63,7 @@ export function useFilterRenderer(canvasRef: RefObject<HTMLCanvasElement>) {
       fullBitmapRef.current = null;
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
       void disposeFaceLandmarker();
+      void disposePersonSegmenter();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -81,6 +84,7 @@ export function useFilterRenderer(canvasRef: RefObject<HTMLCanvasElement>) {
       // slimming a jaw and painting lipstick using another person's landmarks.
       renderer.setFaceMask(null);
       renderer.setFaceGeometry(null);
+      renderer.setPersonSegmentation(null);
       setFaceScale(DEFAULT_FACE_SCALE);
       setFaceMaskActive(false);
       renderer.setImage(working.canvas, working.width, working.height);
@@ -89,9 +93,9 @@ export function useFilterRenderer(canvasRef: RefObject<HTMLCanvasElement>) {
   );
 
   /**
-   * Runs face detection on the current working image and bakes everything derived
-   * from it: the region mask every filter samples, and the mesh deformation and
-   * makeup masks the makeup filter samples.
+   * Runs face detection and person segmentation on the current image and bakes
+   * everything derived from them: the region mask and the segmentation every filter
+   * can sample, and the mesh deformation and makeup masks the makeup filter samples.
    *
    * Resolves to true only when something was actually applied, so callers know
    * whether a re-render is needed. Never rejects — detection is optional, and a
@@ -101,17 +105,37 @@ export function useFilterRenderer(canvasRef: RefObject<HTMLCanvasElement>) {
     const renderer = rendererRef.current;
     const working = workingRef.current;
     if (!renderer || !working) return false;
-    const detection = await detectFace(working.canvas);
+    // The full-resolution bitmap, not the working canvas: the refine pass crops the
+    // face out of it, and that is what makes the landmarks precise on a full-length
+    // shot where the face is small in frame.
+    const full = fullBitmapRef.current;
+    const source: CanvasImageSource = full ?? working.canvas;
+    const width = full ? full.width : working.width;
+    const height = full ? full.height : working.height;
+    const detection = await detectFace(source, width, height);
     // The renderer may have moved on to a different image while we were away.
-    if (!detection || workingRef.current !== working) return false;
+    if (workingRef.current !== working) return false;
 
+    // Segmentation runs whether or not a face was found: a photo with no detectable
+    // face can still have skin and hair in it. With a face it is cropped around the
+    // head, which is where its resolution matters.
+    const segmentation = await segmentPerson(
+      source,
+      width,
+      height,
+      detection ? faceSquare(detection.landmarks, width, height) : null,
+    );
+    if (workingRef.current !== working) return false;
+    if (segmentation) renderer.setPersonSegmentation(segmentation);
+
+    if (!detection) return segmentation !== null;
     const mask = buildFaceMaskTexture(
       detection.landmarks,
       detection.maskRings,
       detection.imageWidth,
       detection.imageHeight,
     );
-    if (!mask) return false;
+    if (!mask) return segmentation !== null;
     renderer.setFaceMask(mask.texture, mask.faceScale);
     setFaceScale(mask.faceScale);
     setFaceMaskActive(true);

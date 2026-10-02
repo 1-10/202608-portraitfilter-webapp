@@ -20,9 +20,8 @@ import {
   type Connection,
   type NormalizedLandmark,
 } from "./faceMeshTopology";
-
-/** Give up rather than make the user wait on a wedged model load. */
-const DETECT_TIMEOUT_MS = 8000;
+import { detectTwoPass, type DetectInRegion, type Region } from "./faceSearch";
+import { assetBase, LOAD_TIMEOUT_MS, withTimeout } from "./mediapipeAssets";
 
 type Landmarker = {
   detect: (image: TexImageSource) => { faceLandmarks: NormalizedLandmark[][] };
@@ -56,12 +55,6 @@ export type FaceDetection = {
 let landmarkerPromise: Promise<Landmarker | null> | null = null;
 let cachedTopology: Topology | null = null;
 
-function assetBase(): string {
-  // Relative to baseURI rather than a rooted path, so the app still works if it is
-  // ever deployed under a sub-path.
-  return new URL("mediapipe/", document.baseURI).toString();
-}
-
 /** First ring of a connection list, for regions that have exactly one contour. */
 function singleRing(connections: readonly Connection[]): number[] {
   return ringsFromConnections(connections)[0] ?? [];
@@ -80,12 +73,14 @@ async function loadLandmarker(): Promise<Landmarker | null> {
         modelAssetPath: `${base}face_landmarker.task`,
         // CPU, not GPU: the GPU delegate creates its OWN WebGL context alongside
         // the renderer's. Two live contexts plus a 4096px export is exactly how
-        // you provoke context loss. Detection runs once per image on a <=1280px
-        // still, where CPU inference is fast enough to be invisible.
+        // you provoke context loss. Detection runs once per image, in the
+        // background after the first preview is on screen.
         delegate: "CPU",
       },
       runningMode: "IMAGE",
-      numFaces: 1,
+      // A ceiling, not a cost: only faces actually present are paid for. More than one
+      // is needed because the most confident face is not necessarily the subject.
+      numFaces: 5,
       outputFaceBlendshapes: false,
       outputFacialTransformationMatrixes: false,
     });
@@ -124,56 +119,49 @@ async function loadLandmarker(): Promise<Landmarker | null> {
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
-  return Promise.race([promise, new Promise<null>((resolve) => setTimeout(() => resolve(null), ms))]);
-}
-
-/** Bounding-box area of a landmark set, used to pick the subject among several faces. */
-function boundsArea(face: readonly NormalizedLandmark[]): number {
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const p of face) {
-    minX = Math.min(minX, p.x);
-    minY = Math.min(minY, p.y);
-    maxX = Math.max(maxX, p.x);
-    maxY = Math.max(maxY, p.y);
-  }
-  return (maxX - minX) * (maxY - minY);
+/**
+ * One landmarker run on `region` of `source`, resampled to at most `longSide`.
+ *
+ * The resample canvas is reused across runs; smoothing is forced to high quality
+ * because the scout pass exists precisely to avoid aliased downscales.
+ */
+function regionDetector(landmarker: Landmarker, source: CanvasImageSource): DetectInRegion | null {
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  return (region: Region, longSide: number) => {
+    const scale = Math.min(1, longSide / Math.max(region.w, region.h));
+    canvas.width = Math.max(1, Math.round(region.w * scale));
+    canvas.height = Math.max(1, Math.round(region.h * scale));
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(source, region.x, region.y, region.w, region.h, 0, 0, canvas.width, canvas.height);
+    return landmarker.detect(canvas)?.faceLandmarks ?? [];
+  };
 }
 
 /**
  * Detects the largest face in `source`, or returns `null` if detection is
  * unavailable or finds nothing.
  *
- * Pass the working-resolution canvas rather than the full-size bitmap: landmarks
- * are normalized so everything derived from them is identical either way, and
- * inference is several times faster.
+ * Pass the FULL-resolution image: the refine pass crops around the face from it, and
+ * that is where the landmark precision comes from (see faceSearch.ts). Landmarks are
+ * normalized, so everything derived from them works at any resolution.
  */
-export async function detectFace(source: HTMLCanvasElement): Promise<FaceDetection | null> {
+export async function detectFace(
+  source: CanvasImageSource,
+  width: number,
+  height: number,
+): Promise<FaceDetection | null> {
   try {
-    if (!landmarkerPromise) landmarkerPromise = withTimeout(loadLandmarker(), DETECT_TIMEOUT_MS);
+    if (!landmarkerPromise) landmarkerPromise = withTimeout(loadLandmarker(), LOAD_TIMEOUT_MS);
     const landmarker = await landmarkerPromise;
     if (!landmarker || !cachedTopology) return null;
 
-    const result = landmarker.detect(source);
-    const faces = result?.faceLandmarks ?? [];
-    if (faces.length === 0) return null;
-
-    // numFaces is 1, but stay explicit: if several are ever returned, the subject
-    // is the largest one, not whichever the model happened to list first.
-    let best = faces[0]!;
-    if (faces.length > 1) {
-      let bestArea = -1;
-      for (const face of faces) {
-        const area = boundsArea(face);
-        if (area > bestArea) {
-          bestArea = area;
-          best = face;
-        }
-      }
-    }
+    const detect = regionDetector(landmarker, source);
+    if (!detect) return null;
+    const best = detectTwoPass(detect, width, height);
+    if (!best) return null;
 
     const topology = cachedTopology;
     // Ring area is compared in normalized coordinates. The per-axis scale factors
@@ -194,8 +182,8 @@ export async function detectFace(source: HTMLCanvasElement): Promise<FaceDetecti
         lipsInner,
         irises: topology.irisRings,
       },
-      imageWidth: source.width,
-      imageHeight: source.height,
+      imageWidth: width,
+      imageHeight: height,
     };
   } catch (err) {
     if (import.meta.env.DEV) console.warn("[faceLandmarks] detection failed:", err);
