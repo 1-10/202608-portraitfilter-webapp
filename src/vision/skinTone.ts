@@ -19,6 +19,9 @@ import { distance, type FaceFrame, type Pt } from "./faceMeshTopology";
 /** Samples per axis over the face bounding box. */
 const GRID = 20;
 
+/** OKLab chroma below which a sample is treated as hair rather than skin. */
+const MIN_SKIN_CHROMA = 0.02;
+
 /** This subject's median skin colour, in OKLab. */
 export type SkinTone = { l: number; a: number; b: number };
 
@@ -118,8 +121,15 @@ export function measureSkinTone(
     }
   }
   if (samples.length < 12) return null;
+  // A heavy fringe can cover a large share of the oval, more than a median can
+  // shrug off, and it drags the skin value dark — which every relative test, and
+  // the AI look's lightness pull, then over-corrects for. Hair is near neutral and
+  // skin is not (OKLab chroma: hair under ~0.01, skin 0.025-0.10), so near-neutral
+  // samples are dropped first, as long as enough remain to take a median.
+  const chromatic = samples.filter((t) => Math.hypot(t.a, t.b) >= MIN_SKIN_CHROMA);
+  const used = chromatic.length >= 12 ? chromatic : samples;
   const median = (channel: keyof SkinTone): number => {
-    const values = samples.map((t) => t[channel]).sort((x, y) => x - y);
+    const values = used.map((t) => t[channel]).sort((x, y) => x - y);
     return values[Math.floor(values.length / 2)]!;
   };
   return { l: median("l"), a: median("a"), b: median("b") };

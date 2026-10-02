@@ -96,7 +96,7 @@ npm run test:e2e     # Playwright E2Eテスト（初回は `npx playwright insta
 
 - `@mediapipe/tasks-vision` を**バージョン完全固定**で依存に追加（wasmとJSグルーは対で一致している必要があるため）
 - wasmは `scripts/copy-mediapipe-wasm.mjs` が `postinstall`/`prebuild` で `node_modules` から `public/mediapipe/wasm/` へコピー（SIMD版のみ）
-- モデル `public/mediapipe/face_landmarker.task`（3.7MB）と `public/mediapipe/selfie_multiclass_256x256.tflite`（16MB）はnpmに含まれないためリポジトリに配置。取得元は MediaPipe 公式の `storage.googleapis.com/mediapipe-models/`（`face_landmarker/float16/1`、`image_segmenter/selfie_multiclass_256x256/float32/1`）
+- モデル `public/mediapipe/face_landmarker.task`（3.7MB）と `public/mediapipe/selfie_multiclass_256x256.tflite`（16MB）はnpmに含まれないためリポジトリに配置。取得元は MediaPipe 公式の `storage.googleapis.com/mediapipe-models/`（`face_landmarker/float16/1`、`image_segmenter/selfie_multiclass_256x256/float32/1`）。どちらも Apache License 2.0（各モデルカードに記載）
 - CSPに `'wasm-unsafe-eval'` を追加。これはWebAssemblyのコンパイルのみを許可するもので、`eval()` や `new Function()` は許可しません。**`connect-src 'self'` は変更していないため、画像が外部に出ない保証は不変です**
 - ランドマークの並びは `FaceLandmarker.FACE_LANDMARKS_*` の接続リストから実行時に環状に組み立てます（インデックス直書きはモデル更新で壊れるため）
 - マスクは **256px固定・正規化UVでサンプリング**するため、プレビュー／サムネイル／書き出しで作り直す必要がありません

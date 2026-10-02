@@ -1,5 +1,7 @@
 import { buildFragmentShader, inputUniform, paramUniform } from "../rendering/shaders/glslCommon";
 import type { FilterDefinition } from "../types";
+import { flowPass, flowTensorBlurPass, flowTensorPass } from "./shared/flowField";
+import { guidedCoefPass, guidedMeanPass, guidedOutput, PACK16_GLSL } from "./shared/guidedFilter";
 import { chromaBlurPass, lumaBlurPass } from "./shared/skinRetouch";
 
 /**
@@ -25,14 +27,62 @@ import { chromaBlurPass, lumaBlurPass } from "./shared/skinRetouch";
 /**
  * Band radii, as fractions of face width. See shared/skinRetouch.ts.
  *
- * Everything finer than the mid radius is erased almost completely and everything
- * between the two is softened by a third; the low radius is the boundary of untouchable shading.
- * It sits at 0.03 because the nose, chin and cheekbone modelling the reference keeps
- * is 0.05-0.15 of face width, and a low band that reaches into that range flattens
- * the nose.
+ * The skin itself is smoothed by the guided filter below, not by these bands. They
+ * serve the operations that need a local reference: the low band is the broad
+ * shading the shine layer and the warm-shadow term are measured against, the mid
+ * band separates fine from mid detail on the lips. The low radius stays below the
+ * 0.05-0.15 face-width scale of the nose and cheekbone modelling, so measuring
+ * against it never treats form as shine.
  */
 const BAND_LOW_RADIUS = 0.03;
 const BAND_MID_RADIUS = 0.007;
+
+/**
+ * Guided-filter window radius (fraction of face width) and eps (squared OKLab L).
+ * Deviations below sqrt(eps) = 0.04 L — pores, blotches, fine lines — are flattened;
+ * nostrils, the lip line, brow and lid edges are larger and are kept.
+ */
+const GF_RADIUS = 0.012;
+const GF_EPS = 0.04 * 0.04;
+
+/**
+ * Radius of the opening that regularizes skin shine, as a fraction of face width.
+ * Glints smaller than this — the irregular oily speckle and streaks of a real face —
+ * are removed; compact highlights larger than it survive.
+ */
+const SHINE_OPEN_RADIUS = 0.008;
+
+/** Shine is stored x4 so its small range uses more of the 16-bit packing. */
+const SHINE_SCALE = 4;
+
+/**
+ * Pass: the shine layer (lightness above the broad shading), eroded over a small
+ * disk, or dilated back over the same disk ("min" then "max" is a morphological
+ * opening).
+ */
+function shineOpenPass(op: "min" | "max"): string {
+  const read =
+    op === "min"
+      ? `max(linearRgbToOklab(srgbToLinear(texture(uOriginal, uv).rgb)).x - texture(${inputUniform("lumaLowV")}, uv).r, 0.0) * ${SHINE_SCALE.toFixed(1)}`
+      : "unpack16(texture(uSource, uv).xy)";
+  return buildFragmentShader({
+    extraUniforms: `${PACK16_GLSL}${op === "min" ? `
+uniform sampler2D ${inputUniform("lumaLowV")};` : ""}`,
+    body: `
+  float faceWidthPx = max(uFaceScale * uResolution.x * 2.5, 24.0);
+  vec2 stepUv = (max(faceWidthPx * ${SHINE_OPEN_RADIUS.toFixed(4)}, 1.0) / 2.0) / uResolution;
+  float acc = ${op === "min" ? "1.0" : "0.0"};
+  for (int y = -2; y <= 2; y++) {
+    for (int x = -2; x <= 2; x++) {
+      vec2 o = vec2(float(x), float(y));
+      if (dot(o, o) > 5.0) continue;
+      vec2 uv = vUv + o * stepUv;
+      acc = ${op}(acc, ${read});
+    }
+  }
+  fragColor = vec4(pack16(acc), 0.0, 1.0);`,
+  });
+}
 
 /** Long-edge cap for the blur passes; their radii are face-relative, so this costs precision only. */
 const BAND_CAP = 1600;
@@ -40,7 +90,8 @@ const BAND_CAP = 1600;
 /**
  * Range of OKLab lightness the skin can be pulled toward, set by the "仕上がりの白さ"
  * slider. The reference lands every subject's skin in a narrow band around 0.745
- * regardless of how dark the source exposure was, which is the slider's default.
+ * regardless of how dark the source exposure was; the slider's default sits just
+ * below it because the restored skin sheen adds its own lightness on top.
  */
 const TARGET_SKIN_L_MIN = 0.7;
 const TARGET_SKIN_L_RANGE = 0.1;
@@ -52,6 +103,9 @@ const skinPass = buildFragmentShader({
   extraUniforms: `uniform sampler2D ${inputUniform("chromaV")};
 uniform sampler2D ${inputUniform("lumaLowV")};
 uniform sampler2D ${inputUniform("lumaMidV")};
+uniform sampler2D ${inputUniform("gfMean")};
+uniform sampler2D ${inputUniform("shineMax")};
+${PACK16_GLSL}
 uniform float ${paramUniform("smooth")};
 uniform float ${paramUniform("tone")};
 uniform float ${paramUniform("clarity")};
@@ -95,24 +149,24 @@ uniform float ${paramUniform("flush")};`,
   float edge = sobelEdge01(uOriginal, vUv, uOriginalTexelSize * edgeStep);
   float gate = clamp(region * (1.0 - smoothstep(0.3, 0.75, edge)), 0.0, 1.0);
 
-  // The reference does not soften the subject's own pores, it removes them: the
-  // fine band it keeps is a few percent of the source's, and that, more than any
-  // colour or tone, is what makes it read as a doll rather than retouched skin. So
-  // the fine band reaches zero by the default setting, the mid band is roughly
-  // halved, and the coarse shading is left alone. Both shifts are clamped: a nostril
-  // or the mouth line is a large deviation in the same band as a blotch, and an
-  // unclamped scale erases it along with the blotch.
+  // The reference does not soften the subject's own pores, it removes them, and it
+  // keeps every feature edge crisp: flat interiors with sharp edges is the doll
+  // finish, flat interiors with softened edges is a retouched photo. So the skin is
+  // replaced by an edge-preserving (guided) smooth of itself rather than by a blend
+  // of Gaussian bands, which would soften every nostril and lip line the gate does
+  // not fully protect. The edge gate is correspondingly weak: the filter itself
+  // keeps the edges.
   float sAmt = min(smoothAmount * 1.25, 1.0);
-  float kPore = mix(1.0, 0.0, sAmt * gate);
-  float kBlemish = mix(1.0, 0.4, smoothAmount * gate);
-  float poreShift = clamp(pore * kPore - pore, -0.035, 0.035);
-  // Bright fine detail on the lit side of the face is specular sheen, which the
-  // reference keeps; erasing it is a large part of what reads as matte and flat.
-  // Only distinct peaks on clearly lit skin count; ordinary pores on the lit cheek
-  // are still removed.
-  poreShift *= 1.0 - ${paramUniform("shine")} / 100.0 * smoothstep(0.012, 0.03, pore) * smoothstep(1.05, 1.15, Lmid / max(uFaceSkinLightness, 0.05));
-  float blemishShift = clamp(blemish * kBlemish - blemish, -0.03, 0.03);
-  float L2 = lab.x + poreShift + blemishShift;
+  float gfGate = clamp(region * (1.0 - smoothstep(0.5, 0.95, edge)), 0.0, 1.0);
+  float L2 = mix(lab.x, ${guidedOutput("gfMean", "lab.x")}, sAmt * gfGate);
+
+  // Shine: a real face has irregular oily speckle and streaks; the reference has a
+  // satin field with compact highlights. The shine layer is replaced by its opening,
+  // which removes glints smaller than the opening disk and keeps larger highlights.
+  // Eyes and lips are left out: their catchlights and gloss are glints by this test.
+  float shine = max(lab.x - Llow, 0.0);
+  float shineOpen = min(unpack16(texture(${inputUniform("shineMax")}, vUv).xy) / ${SHINE_SCALE.toFixed(1)}, shine);
+  float glintW = (1.0 - ${paramUniform("shine")} / 100.0) * region;
 
   // Chroma blotches are smoothed toward the local mean; the eye cannot resolve chroma
   // at this scale, so it costs no sharpness.
@@ -123,6 +177,17 @@ uniform float ${paramUniform("flush")};`,
   // Lips: the reference's are smooth, without creases. Lightness only, since a chroma
   // blur would bleed skin colour into them; the clamps keep the lip's darkness against
   // the skin and the vermilion edge, and the edge gate keeps the outline.
+  glintW *= (1.0 - lipW) * (1.0 - clamp(regions.g, 0.0, 1.0) * uHasFaceMask);
+  // The shine layer of the smoothed skin is rebuilt, not just trimmed: the guided
+  // filter flattens soft highlights along with pores (a cheek or forehead sheen is a
+  // deviation below its eps), and that is where gloss goes. Rebuilding the layer from
+  // the source's own shine — glints opened away, compact highlights kept — brings
+  // the gloss back without the oily speckle.
+  float targetShine = mix(shine, shineOpen, glintW);
+  float smoothedShine = max(L2 - Llow, 0.0);
+  // Only ever ADDED back: where the source is darker than its surroundings the
+  // target is zero, and pulling the smoothed skin down to it would put the pores back.
+  L2 += max(targetShine - smoothedShine, 0.0) * region * (1.0 - lipW);
   float lipSmooth = 0.8 * lipW * (1.0 - smoothstep(0.3, 0.75, edge)) * sAmt;
   L2 -= lipSmooth * (clamp(pore, -0.04, 0.04) + 0.4 * clamp(blemish, -0.015, 0.015));
   float skinL = uFaceSkinLightness;
@@ -223,6 +288,48 @@ uniform float ${paramUniform("flush")};`,
 });
 
 /**
+ * Hair strands smoothed ALONG the local flow (a short line-integral convolution).
+ *
+ * A compressed phone photo's hair is ragged — broken strands, blocky edges — and
+ * sharpening makes that worse; the reference's strands are long and coherent.
+ * Averaging along the strand direction joins the broken pieces without blurring
+ * across strands, and the detail pass then sharpens across them. Gated by the hair
+ * class and by anisotropy, so only genuinely directional hair is touched.
+ */
+const hairFlowPass = buildFragmentShader({
+  extraUniforms: `uniform sampler2D ${inputUniform("flow")};
+uniform float ${paramUniform("hair")};`,
+  body: `
+  vec3 base = texture(uSource, vUv).rgb;
+  vec4 seg = personSeg(vUv);
+  vec4 f = texture(${inputUniform("flow")}, vUv);
+  float w = personSegCoverage(vUv) * seg.r * smoothstep(0.2, 0.5, f.b) * clamp(${paramUniform("hair")} / 55.0, 0.0, 2.0);
+  if (w <= 0.0) {
+    fragColor = vec4(base, 1.0);
+    return;
+  }
+  float faceWidthPx = max(uFaceScale * uResolution.x * 2.5, 24.0);
+  vec2 stepUv = max(faceWidthPx * 0.006, 1.0) / uResolution;
+  vec2 tangent = f.rg * 2.0 - 1.0;
+  vec3 acc = base;
+  float accW = 1.0;
+  for (int side = 0; side < 2; side++) {
+    vec2 p = vUv;
+    vec2 d = side == 0 ? tangent : -tangent;
+    for (int s = 1; s <= 4; s++) {
+      vec2 dn = texture(${inputUniform("flow")}, p).rg * 2.0 - 1.0;
+      if (dot(dn, d) < 0.0) dn = -dn;
+      d = dn;
+      p += d * stepUv;
+      float sw = gaussW(float(s), 2.5);
+      acc += texture(uSource, p).rgb * sw;
+      accW += sw;
+    }
+  }
+  fragColor = vec4(mix(base, acc / accW, clamp(0.5 * w, 0.0, 1.0)), 1.0);`,
+});
+
+/**
  * Hair, eye and silhouette sharpening, plus the hair tone change, applied to the
  * retouched frame.
  *
@@ -287,6 +394,23 @@ uniform float ${paramUniform("hair")};`,
   if (add > 0.0) add *= mix(1.0, max(smoothstep(0.4, 0.8, seg.r), eyes), segCov);
   float L2 = lab.x + clamp(add, -0.08, 0.08);
 
+  // Feature edges — brows, lip outline, nostrils, the jaw — crisped along strong
+  // structure only. The skin pass leaves interiors flat; this gives their edges the
+  // clean, drawn quality the reference has. The gradient is taken at a few times the
+  // unsharp radius so pore-scale noise, already removed, cannot trigger it, and the
+  // gain is small and clamped so an edge gets crisper rather than haloed.
+  vec2 gStep = 2.0 * sigmaPx * uTexelSize;
+  float gx = linearRgbToOklab(srgbToLinear(texture(uSource, vUv + vec2(gStep.x, 0.0)).rgb)).x
+           - linearRgbToOklab(srgbToLinear(texture(uSource, vUv - vec2(gStep.x, 0.0)).rgb)).x;
+  float gy = linearRgbToOklab(srgbToLinear(texture(uSource, vUv + vec2(0.0, gStep.y)).rgb)).x
+           - linearRgbToOklab(srgbToLinear(texture(uSource, vUv - vec2(0.0, gStep.y)).rgb)).x;
+  float strong = smoothstep(0.02, 0.05, 0.5 * length(vec2(gx, gy)));
+  float faceOval = texture(uFaceMask, vUv).a * uHasFaceMask;
+  // Hair inside the face oval (a fringe) is already sharpened as hair; doubling it
+  // up turns strand edges into ink lines.
+  float featW = detail / 0.55 * faceOval * (1.0 - eyes) * (1.0 - seg.r * segCov) * strong;
+  L2 += clamp(hp * 0.6 * featW, -0.04, 0.04);
+
   // Hair: contrast stretched about a pivot above most hair tones, so strands
   // separate, blacks deepen, and only the strand highlights get brighter (a lower
   // pivot brightens grey hair as a whole). Hair already at or below 0.20 is left
@@ -314,7 +438,7 @@ export const aiLookFilter: FilterDefinition = {
     { id: "detail", label: "くっきり感（目・輪郭）", min: 0, max: 100, step: 1, defaultValue: 55 },
     { id: "target", label: "仕上がりの白さ", min: 0, max: 100, step: 1, defaultValue: 45 },
     { id: "hair", label: "髪のツヤ・黒さ", min: 0, max: 100, step: 1, defaultValue: 55 },
-    { id: "shine", label: "ツヤの残し具合", min: 0, max: 100, step: 1, defaultValue: 50 },
+    { id: "shine", label: "ツヤの残し具合", min: 0, max: 100, step: 1, defaultValue: 30 },
     { id: "warmth", label: "陰影の暖かみ", min: 0, max: 100, step: 1, defaultValue: 50 },
     { id: "flush", label: "頬の赤み除去", min: 0, max: 100, step: 1, defaultValue: 70 },
   ],
@@ -325,12 +449,20 @@ export const aiLookFilter: FilterDefinition = {
     { id: "lumaLowV", label: "lumaLowV (低周波 V)", fragmentSource: lumaBlurPass("y", "chain", BAND_LOW_RADIUS), outputScale: 0.5, maxOutputLongEdge: BAND_CAP },
     { id: "lumaMidH", label: "lumaMidH (中間帯 H)", fragmentSource: lumaBlurPass("x", "original", BAND_MID_RADIUS), maxOutputLongEdge: 2048 },
     { id: "lumaMidV", label: "lumaMidV (中間帯 V)", fragmentSource: lumaBlurPass("y", "chain", BAND_MID_RADIUS), maxOutputLongEdge: 2048 },
+    { id: "gfCoef", label: "gfCoef (ガイデッド係数)", fragmentSource: guidedCoefPass(GF_RADIUS, GF_EPS), outputScale: 0.5, maxOutputLongEdge: BAND_CAP },
+    { id: "gfMean", label: "gfMean (ガイデッド平均)", fragmentSource: guidedMeanPass(GF_RADIUS), outputScale: 0.5, maxOutputLongEdge: BAND_CAP },
+    { id: "shineMin", label: "shineMin (テカリ収縮)", fragmentSource: shineOpenPass("min"), outputScale: 0.5, maxOutputLongEdge: BAND_CAP, extraInputs: ["lumaLowV"] },
+    { id: "shineMax", label: "shineMax (テカリ膨張)", fragmentSource: shineOpenPass("max"), outputScale: 0.5, maxOutputLongEdge: BAND_CAP },
+    { id: "tensor", label: "tensor (構造テンソル)", fragmentSource: flowTensorPass("original"), outputScale: 0.5, maxOutputLongEdge: 800 },
+    { id: "tensorBlur", label: "tensorBlur (テンソル平滑)", fragmentSource: flowTensorBlurPass, outputScale: 0.5, maxOutputLongEdge: 800 },
+    { id: "flow", label: "flow (流れ場)", fragmentSource: flowPass, outputScale: 0.5, maxOutputLongEdge: 800 },
     {
       id: "skin",
       label: "skin (肌・トーン)",
       fragmentSource: skinPass,
-      extraInputs: ["chromaV", "lumaLowV", "lumaMidV"],
+      extraInputs: ["chromaV", "lumaLowV", "lumaMidV", "gfMean", "shineMax"],
     },
+    { id: "hairFlow", label: "hairFlow (髪の流れ平滑)", fragmentSource: hairFlowPass, extraInputs: ["flow"] },
     { id: "detail", label: "detail (髪・輪郭シャープ)", fragmentSource: detailPass },
   ],
   presets: [
