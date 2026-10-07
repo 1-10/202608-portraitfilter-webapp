@@ -1,7 +1,41 @@
 .wrapper {
   width: 100%;
+  /* The panel is a flex column; an overflow container may otherwise be shrunk
+     away (notably in Safari) when the controls below are tall. */
+  flex-shrink: 0;
   overflow-x: auto;
-  padding-bottom: var(--space-1);
+  padding-bottom: var(--space-2);
+}
+
+/* macOS draws overlay scrollbars that only appear while scrolling, so with a
+   mouse there is no hint that more filters exist off to the right and no
+   visible handle to drag. Styling the scrollbar opts out of the overlay
+   behaviour and keeps it permanently visible in Chrome and Safari. */
+.wrapper::-webkit-scrollbar {
+  height: 10px;
+}
+
+.wrapper::-webkit-scrollbar-track {
+  background: var(--color-bg-panel);
+  border-radius: 999px;
+}
+
+.wrapper::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 999px;
+}
+
+.wrapper::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Firefox has no ::-webkit-scrollbar; Chrome 121+ would ignore the rules
+   above if these were set unconditionally. */
+@supports not selector(::-webkit-scrollbar) {
+  .wrapper {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border-strong) var(--color-bg-panel);
+  }
 }
 
 .list {
